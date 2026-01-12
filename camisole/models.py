@@ -141,7 +141,8 @@ class Lang(metaclass=MetaLang):
 
         isolator = camisole.isolate.Isolator(
             self.opts.get('compile', {}),
-            allowed_dirs=self.get_allowed_dirs() + tmparg)
+            allowed_dirs=self.get_allowed_dirs() + tmparg,
+            box_id=self.opts.get('box_id')) #Added box Id to isolator from api
         async with isolator:
             wd = Path(isolator.path)
             env = {'HOME': self.filter_box_prefix(str(wd))}
@@ -158,7 +159,7 @@ class Lang(metaclass=MetaLang):
 
         return (isolator.isolate_retcode, isolator.info, binary)
 
-    async def execute(self, binary, opts=None):
+    async def execute(self, binary, opts=None): #For execution
         if opts is None:
             opts = {}
         opts = {**self.opts.get('execute', {}), **opts}
@@ -167,7 +168,8 @@ class Lang(metaclass=MetaLang):
             input_data = camisole.utils.force_bytes(opts['stdin'])
 
         isolator = camisole.isolate.Isolator(
-            opts, allowed_dirs=self.get_allowed_dirs())
+            opts, allowed_dirs=self.get_allowed_dirs(),
+            box_id=self.opts.get('box_id'))
         async with isolator:
             wd = isolator.path
             env = {'HOME': self.filter_box_prefix(str(wd))}

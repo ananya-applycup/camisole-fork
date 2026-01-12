@@ -114,6 +114,7 @@ EXECUTE_PROPERTIES = {
 RUN_SCHEMA = {
     'lang': str,
     'source': str_bytes,
+    'box_id': O(int), #Added box Id to api /run input
     'all_fatal': O(bool),
     'compile': O(ISOLATE_OPTS_PROPERTIES),
     'execute': O(EXECUTE_PROPERTIES),

@@ -26,6 +26,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+from contextlib import asynccontextmanager
 
 from camisole.conf import conf
 from camisole.utils import cached_classmethod
@@ -33,6 +34,117 @@ from camisole.utils import cached_classmethod
 
 LIBC = ctypes.CDLL('libc.so.6')
 LIBC.strsignal.restype = ctypes.c_char_p
+
+
+# ============================================================================
+# Box Lock Manager - Phase 2: Request-Level Locking
+# ============================================================================
+
+# Global registry of locks, one per box_id
+_box_locks = {}
+_box_locks_lock = asyncio.Lock()
+
+
+class BoxBusyError(Exception):
+    """Raised when box is busy (lock acquisition timeout)."""
+    pass
+
+
+class BoxUnavailableError(Exception):
+    """Raised when box is broken/unavailable (init fails after retry)."""
+    pass
+
+
+async def get_box_lock(box_id: int):
+    """
+    Get or create an asyncio.Lock for a specific box_id.
+    Thread-safe creation using _box_locks_lock.
+    """
+    async with _box_locks_lock:
+        if box_id not in _box_locks:
+            _box_locks[box_id] = asyncio.Lock()
+        return _box_locks[box_id]
+
+
+@asynccontextmanager
+async def acquire_box(box_id: int, timeout: float = 5.0):
+    """
+    Acquire exclusive access to an isolate box for the duration of a request.
+    
+    This context manager:
+    1. Acquires a per-box lock (with timeout)
+    2. Cleans up any leftover state
+    3. Initializes the box (with one retry on failure)
+    4. Yields control for compile + execute
+    5. Cleans up and releases lock (even on exception)
+    
+    Args:
+        box_id: The isolate box ID to acquire (0 to num_boxes-1)
+        timeout: Max seconds to wait for lock acquisition (default 5s)
+    
+    Raises:
+        BoxBusyError: If lock cannot be acquired within timeout (409 Conflict)
+        BoxUnavailableError: If box init fails after retry (503 Service Unavailable)
+    
+    Example:
+        async with acquire_box(box_id=0):
+            # Box 0 is exclusively yours, ready to use
+            result = await lang.run()
+    """
+    box_lock = await get_box_lock(box_id)
+    acquired = False  # FIX 1: Track if WE acquired the lock
+    
+    try:
+        # Try to acquire lock with timeout
+        await asyncio.wait_for(box_lock.acquire(), timeout=timeout)
+        acquired = True
+        
+    except asyncio.TimeoutError:
+        # Lock is held by another request - return 409 Conflict
+        raise BoxBusyError(f"Box {box_id} is busy (timeout after {timeout}s)")
+    
+    try:
+        cmd_base = ['isolate', '--box-id', str(box_id), '--cg']
+        
+        # FIX 2 & 4: Cleanup at START (ignore errors - box might not exist yet)
+        cmd_cleanup = cmd_base + ['--cleanup']
+        await communicate(cmd_cleanup)
+        
+        # FIX 2: Init box (must succeed, retry once if fails)
+        cmd_init = cmd_base + ['--init']
+        retcode, stdout, stderr = await communicate(cmd_init)
+        
+        if retcode != 0:
+            # Init failed - retry once after cleanup
+            logging.warning(f"Box {box_id} init failed, retrying: {stderr.decode()}")
+            await communicate(cmd_cleanup)
+            retcode, stdout, stderr = await communicate(cmd_init)
+            
+            if retcode != 0:
+                # Still failed - box is unavailable, return 503
+                raise BoxUnavailableError(
+                    f"Box {box_id} init failed after retry: {stderr.decode()}")
+        
+        # Box is ready - yield control for compile + execute
+        yield box_id
+        
+    finally:
+        # FIX 4: Cleanup at END (always, even on exception)
+        try:
+            cmd_cleanup = ['isolate', '--box-id', str(box_id), '--cg', '--cleanup']
+            await communicate(cmd_cleanup)
+        except Exception as e:
+            # Ignore cleanup errors in finally - we tried our best
+            logging.warning(f"Box {box_id} cleanup failed in finally: {e}")
+        
+        # FIX 1: Release lock only if WE acquired it
+        if acquired:
+            box_lock.release()
+
+
+# ============================================================================
+# End of Box Lock Manager
+# ============================================================================
 
 
 def signal_message(signal: int) -> str:
@@ -97,9 +209,10 @@ class IsolateInternalError(RuntimeError):
 
 
 class Isolator:
-    def __init__(self, opts, allowed_dirs=None):
+    def __init__(self, opts, allowed_dirs=None, box_id=None):
         self.opts = opts
         self.allowed_dirs = allowed_dirs if allowed_dirs is not None else []
+        self.explicit_box_id = box_id
         self.path = None
         self.cmd_base = None
 
@@ -119,22 +232,34 @@ class Isolator:
         self.isolate_stderr = None
 
     async def __aenter__(self):
-        busy = {int(p.name) for p in self.isolate_conf.root.iterdir()}
-        avail = set(range(self.isolate_conf.max_boxes)) - busy
-        while avail:
-            self.box_id = avail.pop()
+        if self.explicit_box_id is not None:
+            # FIX 2 & 3: Use explicit box_id (init already done by acquire_box)
+            # No need to call init or cleanup - acquire_box() handles that
+            self.box_id = self.explicit_box_id
             self.cmd_base = ['isolate', '--box-id', str(self.box_id), '--cg']
-            cmd_init = self.cmd_base + ['--init']
-            retcode, stdout, stderr = await communicate(cmd_init)
-            if retcode == 2 and b"already exists" in stderr:
-                continue
-            if retcode != 0:  # noqa
-                raise RuntimeError("{} returned code {}: “{}”".format(
-                    cmd_init, retcode, stderr))
-            break
+            
+            # FIX 3: Compute path deterministically from config (no isolate calls)
+            self.path = self.isolate_conf.root / str(self.box_id) / 'box'
+            
         else:
-            raise RuntimeError("No isolate box ID available.")
-        self.path = pathlib.Path(stdout.strip().decode()) / 'box'
+            # Auto-allocation: find an available box (backward compatibility)
+            busy = {int(p.name) for p in self.isolate_conf.root.iterdir()}
+            avail = set(range(self.isolate_conf.max_boxes)) - busy
+            while avail:
+                self.box_id = avail.pop()
+                self.cmd_base = ['isolate', '--box-id', str(self.box_id), '--cg']
+                cmd_init = self.cmd_base + ['--init']
+                retcode, stdout, stderr = await communicate(cmd_init)
+                if retcode == 2 and b"already exists" in stderr:
+                    continue
+                if retcode != 0:  # noqa
+                    raise RuntimeError("{} returned code {}: “{}”".format(
+                        cmd_init, retcode, stderr))
+                break
+            else:
+                raise RuntimeError("No isolate box ID available.")
+            self.path = pathlib.Path(stdout.strip().decode()) / 'box'
+        
         self.meta_file = tempfile.NamedTemporaryFile(prefix='camisole-meta-')
         self.meta_file.__enter__()
         return self
@@ -187,11 +312,14 @@ class Isolator:
             'meta': self.meta
         }
 
-        cmd_cleanup = self.cmd_base + ['--cleanup']
-        retcode, stdout, stderr = await communicate(cmd_cleanup)
-        if retcode != 0:  # noqa
-            raise RuntimeError("{} returned code {}: “{}”".format(
-                cmd_cleanup, retcode, stderr))
+        # FIX 5: Cleanup is a safety net for auto-allocated boxes only
+        # Explicit boxes are cleaned by acquire_box() at request boundaries
+        if self.explicit_box_id is None:
+            cmd_cleanup = self.cmd_base + ['--cleanup']
+            retcode, stdout, stderr = await communicate(cmd_cleanup)
+            if retcode != 0:  # noqa
+                raise RuntimeError("{} returned code {}: “{}”".format(
+                    cmd_cleanup, retcode, stderr))
 
         self.meta_file.__exit__(exc, value, tb)
 

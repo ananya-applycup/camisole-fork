@@ -110,7 +110,36 @@ async def run_handler(request, data):
     except KeyError:
         raise RuntimeError('Incorrect language {}'.format(lang_name))
 
-    return await lang.run()
+    # Phase 2: Request-level box locking
+    box_id = data.get('box_id')
+    
+    if box_id is not None:
+        # Explicit box_id provided - acquire lock for entire request
+        try:
+            async with camisole.isolate.acquire_box(box_id, timeout=5.0):
+                # Run compile + execute atomically with locked box
+                return await lang.run()
+                
+        except camisole.isolate.BoxBusyError as e:
+            # Box is currently in use - return error for worker to retry
+            return {
+                'success': False,
+                'error': str(e),
+                'error_code': 'BOX_BUSY',
+                'box_id': box_id
+            }
+            
+        except camisole.isolate.BoxUnavailableError as e:
+            # Box is broken/unavailable - worker should mark itself unhealthy
+            return {
+                'success': False,
+                'error': str(e),
+                'error_code': 'BOX_UNAVAILABLE',
+                'box_id': box_id
+            }
+    else:
+        # No explicit box_id - use auto-allocation (backward compatibility)
+        return await lang.run()
 
 
 @json_msgpack_handler
